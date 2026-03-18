@@ -6,7 +6,11 @@ type SgeQuote = {
   heyue: string;
   times: string[];
   data: (string | number)[];
-  delaystr: string; // e.g. "2025年04月14日 22:28:55"
+  delaystr: string; // e.g. "2026年03月18日 10:23:55"
+};
+
+type SgeDailyHq = {
+  time: [string, number, number, number, number][]; // [date, open, close, low, high]
 };
 
 type GoldSnapshot = {
@@ -17,6 +21,7 @@ type GoldSnapshot = {
   usdCny?: number;
   xauCnyPerGram?: number;
   fetchedAt: Date;
+  errors: string[];
 };
 
 function getConfig() {
@@ -26,11 +31,12 @@ function getConfig() {
     refreshSeconds: cfg.get<number>('refreshSeconds', 60),
     showInternational: cfg.get<boolean>('showInternational', true),
     showInternationalCny: cfg.get<boolean>('showInternationalCny', true),
+    emphasize: cfg.get<boolean>('emphasize', true),
+    toastOnManualError: cfg.get<boolean>('toastOnManualError', true),
   };
 }
 
 function parseLastNonZeroQuote(q: SgeQuote): number | undefined {
-  // q.data is a list of prices; take last non-zero
   for (let i = q.data.length - 1; i >= 0; i--) {
     const v = Number(q.data[i]);
     if (Number.isFinite(v) && v > 0) return v;
@@ -38,42 +44,79 @@ function parseLastNonZeroQuote(q: SgeQuote): number | undefined {
   return undefined;
 }
 
-async function fetchText(url: string, init?: RequestInit): Promise<string> {
-  const res = await fetch(url, init);
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status} ${res.statusText} ${body}`.trim());
+async function fetchText(url: string, init?: RequestInit, timeoutMs = 12_000): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${res.statusText} ${body}`.trim());
+    }
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
   }
-  return await res.text();
 }
 
-async function fetchSgeQuote(symbol: string): Promise<{ price?: number; updateText?: string }> {
-  // SGE is sensitive to request shape and sometimes protected by bot/WAF rules.
-  // The "en" host is empirically more stable for API access.
+async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 12_000): Promise<T> {
+  const text = await fetchText(url, init, timeoutMs);
+  return JSON.parse(text) as T;
+}
+
+async function fetchSgeIntraday(symbol: string): Promise<{ price?: number; updateText?: string }> {
+  // SGE is sometimes protected by WAF rules. The "en" host is empirically more stable.
   const body = new URLSearchParams({ instid: symbol }).toString();
-  const text = await fetchText('https://en.sge.com.cn/graph/quotations', {
+  const json = await fetchJson<SgeQuote>('https://en.sge.com.cn/graph/quotations', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      Accept: 'application/json, text/javascript, */*; q=0.01',
       'X-Requested-With': 'XMLHttpRequest',
-      'Referer': `https://en.sge.com.cn/h5_data_PriceChart?pro_name=${encodeURIComponent(symbol)}`,
-      'Origin': 'https://en.sge.com.cn',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Referer: `https://en.sge.com.cn/h5_data_PriceChart?pro_name=${encodeURIComponent(symbol)}`,
+      Origin: 'https://en.sge.com.cn',
+      'User-Agent': 'Mozilla/5.0 (VSCode Extension; gold-price-vscode)',
     },
     body,
   });
 
-  const json = JSON.parse(text) as SgeQuote;
   return {
     price: parseLastNonZeroQuote(json),
     updateText: json.delaystr,
   };
 }
 
+async function fetchSgeDailyClose(symbol: string): Promise<{ price?: number; updateText?: string }> {
+  // Fallback: daily close from SGE (very stable, but not intraday).
+  const body = new URLSearchParams({ instid: symbol }).toString();
+  const json = await fetchJson<SgeDailyHq>('https://www.sge.com.cn/graph/Dailyhq', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      Accept: 'application/json, text/javascript, */*; q=0.01',
+      'X-Requested-With': 'XMLHttpRequest',
+      Referer: 'https://www.sge.com.cn/sjzx/mrhq',
+      Origin: 'https://www.sge.com.cn',
+      'User-Agent': 'Mozilla/5.0 (VSCode Extension; gold-price-vscode)',
+    },
+    body,
+  });
+
+  const last = json.time?.[json.time.length - 1];
+  if (!last) return {};
+  const date = last[0];
+  const close = Number(last[2]);
+  return {
+    price: Number.isFinite(close) ? close : undefined,
+    updateText: `Daily close: ${date}`,
+  };
+}
+
 function parseStooqCsvClose(csv: string): number | undefined {
-  // Example:
-  // Symbol,Date,Time,Close\r\nUSDCNY,2026-03-18,02:55:16,6.88605\r\n
   const lines = csv.trim().split(/\r?\n/);
   if (lines.length < 2) return undefined;
   const header = lines[0].split(',');
@@ -85,11 +128,11 @@ function parseStooqCsvClose(csv: string): number | undefined {
 }
 
 async function fetchStooqClose(symbol: string): Promise<number | undefined> {
-  const url = `https://stooq.com/q/l/?s=${encodeURIComponent(symbol)}&f=sd2t2c&h&e=csv`;
+  const url = `https://stooq.com/q/l/?s=${encodeURIComponent(symbol)}&f=sd2t2c&h&e=csv&t=${Date.now()}`;
   const csv = await fetchText(url, {
     headers: {
-      'User-Agent': 'Mozilla/5.0',
-      'Accept': 'text/csv,*/*',
+      'User-Agent': 'Mozilla/5.0 (VSCode Extension; gold-price-vscode)',
+      Accept: 'text/csv,*/*',
     },
   });
   return parseStooqCsvClose(csv);
@@ -101,6 +144,7 @@ function formatNum(n: number, digits: number): string {
 
 function renderStatus(s: GoldSnapshot): string {
   const parts: string[] = [];
+
   if (s.sgePriceCnyPerGram != null) {
     parts.push(`${s.sgeSymbol}: ${formatNum(s.sgePriceCnyPerGram, 2)}¥/g`);
   } else {
@@ -140,6 +184,11 @@ function renderTooltip(s: GoldSnapshot): vscode.MarkdownString {
     }
   }
 
+  if (s.errors.length) {
+    md.appendMarkdown(`\n---\n**Errors (latest refresh)**\n`);
+    for (const e of s.errors.slice(0, 5)) md.appendMarkdown(`- ${e}\n`);
+  }
+
   md.appendMarkdown(`\n_Last fetch: ${s.fetchedAt.toLocaleString()}_\n`);
   return md;
 }
@@ -151,52 +200,153 @@ async function refreshSnapshot(): Promise<GoldSnapshot> {
   const snapshot: GoldSnapshot = {
     sgeSymbol: cfg.sgeSymbol,
     fetchedAt,
+    errors: [],
   };
 
-  // Fetch in parallel
-  const [sgeRes, xau, usdCny] = await Promise.all([
-    fetchSgeQuote(cfg.sgeSymbol).catch((e) => {
-      console.warn('[goldPrice] SGE fetch failed:', e);
-      return { price: undefined, updateText: undefined };
-    }),
-    cfg.showInternational ? fetchStooqClose('xauusd') : Promise.resolve(undefined),
-    cfg.showInternational && cfg.showInternationalCny ? fetchStooqClose('usdcny') : Promise.resolve(undefined),
-  ]);
+  // SGE (try intraday first, fallback to daily close)
+  try {
+    const sge = await fetchSgeIntraday(cfg.sgeSymbol);
+    snapshot.sgePriceCnyPerGram = sge.price;
+    snapshot.sgeUpdateText = sge.updateText;
 
-  snapshot.sgePriceCnyPerGram = sgeRes.price;
-  snapshot.sgeUpdateText = sgeRes.updateText;
-  snapshot.xauUsdPerOz = xau;
-  snapshot.usdCny = usdCny;
+    if (snapshot.sgePriceCnyPerGram == null) {
+      snapshot.errors.push('SGE intraday returned no usable price');
+      const daily = await fetchSgeDailyClose(cfg.sgeSymbol);
+      snapshot.sgePriceCnyPerGram = daily.price;
+      snapshot.sgeUpdateText = daily.updateText;
+      if (snapshot.sgePriceCnyPerGram == null) snapshot.errors.push('SGE daily close returned no usable price');
+    }
+  } catch (e: any) {
+    snapshot.errors.push(`SGE fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+    try {
+      const daily = await fetchSgeDailyClose(cfg.sgeSymbol);
+      snapshot.sgePriceCnyPerGram = daily.price;
+      snapshot.sgeUpdateText = daily.updateText;
+      if (snapshot.sgePriceCnyPerGram == null) snapshot.errors.push('SGE daily close returned no usable price');
+    } catch (e2: any) {
+      snapshot.errors.push(`SGE daily close failed: ${e2?.message ? String(e2.message) : String(e2)}`);
+    }
+  }
 
-  if (xau != null && usdCny != null) {
-    snapshot.xauCnyPerGram = (xau * usdCny) / OZ_TO_GRAM;
+  // International (never fail the whole refresh)
+  if (cfg.showInternational) {
+    try {
+      snapshot.xauUsdPerOz = await fetchStooqClose('xauusd');
+      if (snapshot.xauUsdPerOz == null) snapshot.errors.push('XAUUSD returned no usable price');
+    } catch (e: any) {
+      snapshot.errors.push(`XAUUSD fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+    }
+
+    if (cfg.showInternationalCny) {
+      try {
+        snapshot.usdCny = await fetchStooqClose('usdcny');
+        if (snapshot.usdCny == null) snapshot.errors.push('USDCNY returned no usable price');
+      } catch (e: any) {
+        snapshot.errors.push(`USDCNY fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+      }
+    }
+
+    if (snapshot.xauUsdPerOz != null && snapshot.usdCny != null) {
+      snapshot.xauCnyPerGram = (snapshot.xauUsdPerOz * snapshot.usdCny) / OZ_TO_GRAM;
+    }
   }
 
   return snapshot;
 }
 
+type VisualState = 'loading' | 'ok' | 'warning' | 'error';
+
+function applyVisual(status: vscode.StatusBarItem, state: VisualState) {
+  const cfg = getConfig();
+  if (!cfg.emphasize) {
+    status.backgroundColor = undefined;
+    status.color = undefined;
+    return;
+  }
+
+  switch (state) {
+    case 'loading':
+      status.backgroundColor = new vscode.ThemeColor('statusBarItem.prominentBackground');
+      status.color = new vscode.ThemeColor('statusBarItem.prominentForeground');
+      return;
+    case 'ok':
+      status.backgroundColor = new vscode.ThemeColor('statusBarItem.prominentBackground');
+      status.color = new vscode.ThemeColor('statusBarItem.prominentForeground');
+      return;
+    case 'warning':
+      status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+      status.color = new vscode.ThemeColor('statusBarItem.warningForeground');
+      return;
+    case 'error':
+      status.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+      status.color = new vscode.ThemeColor('statusBarItem.errorForeground');
+      return;
+  }
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   status.command = 'goldPrice.refresh';
-  status.text = 'Gold: loading...';
+  status.text = '$(pulse) Gold: loading...';
   status.tooltip = 'Fetching gold prices...';
+  applyVisual(status, 'loading');
   status.show();
 
   let timer: NodeJS.Timeout | undefined;
-  let lastSnapshot: GoldSnapshot | undefined;
+  let inFlight = false;
+  let lastGood: GoldSnapshot | undefined;
 
-  const doRefresh = async () => {
+  const updateFromSnapshot = (snap: GoldSnapshot, state: VisualState) => {
+    const prefix = state === 'error' ? '$(error) ' : state === 'warning' ? '$(warning) ' : '$(pulse) ';
+    status.text = prefix + renderStatus(snap);
+    status.tooltip = renderTooltip(snap);
+    applyVisual(status, state);
+  };
+
+  const doRefresh = async (manual: boolean) => {
+    if (inFlight) return;
+    inFlight = true;
+
     try {
-      status.text = 'Gold: refreshing...';
+      // Keep last good value visible while refreshing.
+      if (lastGood) {
+        updateFromSnapshot({ ...lastGood, errors: [] }, 'loading');
+      } else {
+        status.text = '$(sync~spin) Gold: refreshing...';
+        applyVisual(status, 'loading');
+      }
+
       const snap = await refreshSnapshot();
-      lastSnapshot = snap;
-      status.text = renderStatus(snap);
-      status.tooltip = renderTooltip(snap);
+
+      const hasAny = snap.sgePriceCnyPerGram != null || snap.xauUsdPerOz != null;
+      const hasError = snap.errors.length > 0;
+
+      if (hasAny) {
+        lastGood = snap;
+        updateFromSnapshot(snap, hasError ? 'warning' : 'ok');
+      } else {
+        // No usable data; keep lastGood if available.
+        if (lastGood) {
+          updateFromSnapshot({ ...lastGood, errors: snap.errors }, 'error');
+        } else {
+          updateFromSnapshot(snap, 'error');
+        }
+      }
+
+      const cfg = getConfig();
+      if (manual && cfg.toastOnManualError && snap.errors.length) {
+        void vscode.window.showWarningMessage(`Gold Price: ${snap.errors[0]}`);
+      }
     } catch (e: any) {
       const msg = e?.message ? String(e.message) : String(e);
-      status.text = 'Gold: error (click to retry)';
-      status.tooltip = msg;
-      console.warn('[goldPrice] refresh error:', e);
+      const snap: GoldSnapshot = lastGood
+        ? { ...lastGood, fetchedAt: new Date(), errors: [msg] }
+        : { sgeSymbol: getConfig().sgeSymbol, fetchedAt: new Date(), errors: [msg] };
+      updateFromSnapshot(snap, 'error');
+      if (manual) void vscode.window.showErrorMessage(`Gold Price: ${msg}`);
+      console.warn('[goldPrice] refresh crash:', e);
+    } finally {
+      inFlight = false;
     }
   };
 
@@ -204,21 +354,21 @@ export function activate(context: vscode.ExtensionContext) {
     if (timer) clearInterval(timer);
     const { refreshSeconds } = getConfig();
     const ms = Math.max(10, refreshSeconds) * 1000;
-    timer = setInterval(doRefresh, ms);
+    timer = setInterval(() => void doRefresh(false), ms);
   };
 
   context.subscriptions.push(
     status,
-    vscode.commands.registerCommand('goldPrice.refresh', doRefresh),
+    vscode.commands.registerCommand('goldPrice.refresh', () => void doRefresh(true)),
     vscode.commands.registerCommand('goldPrice.copy', async () => {
-      if (!lastSnapshot) return;
-      await vscode.env.clipboard.writeText(renderStatus(lastSnapshot));
+      if (!lastGood) return;
+      await vscode.env.clipboard.writeText(renderStatus(lastGood));
       vscode.window.setStatusBarMessage('Gold price copied', 1500);
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('goldPrice')) {
         schedule();
-        void doRefresh();
+        void doRefresh(false);
       }
     }),
     {
@@ -229,7 +379,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   schedule();
-  void doRefresh();
+  void doRefresh(false);
 }
 
 export function deactivate() {}

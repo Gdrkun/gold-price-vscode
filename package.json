@@ -52,6 +52,16 @@
           "type": "boolean",
           "default": true,
           "description": "Also show XAU converted to CNY/g using USDCNY from Stooq."
+        },
+        "goldPrice.emphasize": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use prominent/warning/error colors on the status bar item to make it more visible."
+        },
+        "goldPrice.toastOnManualError": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a toast message when manual refresh fails. Auto refresh will not spam toasts."
         }
       }
     }
