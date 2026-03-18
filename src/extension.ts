@@ -48,18 +48,17 @@ async function fetchText(url: string, init?: RequestInit): Promise<string> {
 }
 
 async function fetchSgeQuote(symbol: string): Promise<{ price?: number; updateText?: string }> {
-  // SGE is sensitive to request shape. POST with form data + browser-ish headers works.
+  // SGE is sensitive to request shape and sometimes protected by bot/WAF rules.
+  // The "en" host is empirically more stable for API access.
   const body = new URLSearchParams({ instid: symbol }).toString();
-  // NOTE: SGE endpoint is sometimes protected by bot/WAF rules.
-  // Empirically, a GET request with a body (as used by akshare) is more reliable than a plain POST.
-  const text = await fetchText('https://www.sge.com.cn/graph/quotations', {
-    method: 'GET',
+  const text = await fetchText('https://en.sge.com.cn/graph/quotations', {
+    method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
       'Accept': 'application/json, text/javascript, */*; q=0.01',
       'X-Requested-With': 'XMLHttpRequest',
-      'Referer': 'https://www.sge.com.cn/',
-      'Origin': 'https://www.sge.com.cn',
+      'Referer': `https://en.sge.com.cn/h5_data_PriceChart?pro_name=${encodeURIComponent(symbol)}`,
+      'Origin': 'https://en.sge.com.cn',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     },
     body,
