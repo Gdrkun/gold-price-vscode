@@ -1,0 +1,68 @@
+{
+  "name": "gold-price-vscode",
+  "displayName": "Gold Price (SGE + XAUUSD)",
+  "description": "Show SGE (Au99.99) and international gold price (XAUUSD) in the VS Code status bar.",
+  "version": "0.0.1",
+  "publisher": "drkun",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "goldPrice.refresh",
+        "title": "Gold: Refresh Now"
+      },
+      {
+        "command": "goldPrice.copy",
+        "title": "Gold: Copy Status Text"
+      }
+    ],
+    "configuration": {
+      "title": "Gold Price",
+      "properties": {
+        "goldPrice.sgeSymbol": {
+          "type": "string",
+          "default": "Au99.99",
+          "description": "Shanghai Gold Exchange symbol (e.g. Au99.99, Au(T+D))."
+        },
+        "goldPrice.refreshSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "description": "Auto refresh interval in seconds."
+        },
+        "goldPrice.showInternational": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show XAUUSD (USD/oz) from Stooq."
+        },
+        "goldPrice.showInternationalCny": {
+          "type": "boolean",
+          "default": true,
+          "description": "Also show XAU converted to CNY/g using USDCNY from Stooq."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "package": "npm run compile && vsce package",
+    "lint": "eslint . --ext .ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.1.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.2",
+    "eslint": "^9.0.0",
+    "typescript": "^5.6.3"
+  }
+}
