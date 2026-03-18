@@ -30,6 +30,7 @@ function getConfig() {
     sgeSymbol: cfg.get<string>('sgeSymbol', 'Au99.99'),
     refreshSeconds: cfg.get<number>('refreshSeconds', 60),
     showInternational: cfg.get<boolean>('showInternational', true),
+    internationalSource: cfg.get<'sina' | 'stooq'>('internationalSource', 'sina'),
     showInternationalCny: cfg.get<boolean>('showInternationalCny', true),
     emphasize: cfg.get<boolean>('emphasize', true),
     toastOnManualError: cfg.get<boolean>('toastOnManualError', true),
@@ -138,6 +139,45 @@ async function fetchStooqClose(symbol: string): Promise<number | undefined> {
   return parseStooqCsvClose(csv);
 }
 
+function parseSinaVarLine(line: string): { name: string; values: string[] } | undefined {
+  // e.g. var hq_str_hf_XAU="4994.29,...,伦敦金（现货黄金）";
+  const m = line.match(/^var\s+hq_str_(\w+)="([\s\S]*)";\s*$/);
+  if (!m) return undefined;
+  const name = m[1];
+  const raw = m[2];
+  return { name, values: raw.split(',') };
+}
+
+async function fetchSinaQuotes(names: string[]): Promise<Record<string, string[]>> {
+  const url = `https://hq.sinajs.cn/list=${names.map(encodeURIComponent).join(',')}&t=${Date.now()}`;
+  const text = await fetchText(url, {
+    method: 'GET',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (VSCode Extension; gold-price-vscode)',
+      Referer: 'https://finance.sina.com.cn/',
+      Accept: 'application/javascript,text/plain,*/*',
+    },
+  });
+
+  // Sina responds in GB18030. Node fetch doesn't auto-decode; but in practice many environments still decode.
+  // If decoding issues occur, we'll still be able to parse numeric fields.
+  const out: Record<string, string[]> = {};
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const parsed = parseSinaVarLine(line);
+    if (parsed) out[parsed.name] = parsed.values;
+  }
+  return out;
+}
+
+async function fetchSinaFxLast(symbol: 'fx_sxauusd' | 'fx_susdcny'): Promise<number | undefined> {
+  const map = await fetchSinaQuotes([symbol]);
+  const v = map[symbol];
+  if (!v || v.length < 4) return undefined;
+  const last = Number(v[3]);
+  return Number.isFinite(last) ? last : undefined;
+}
+
 function formatNum(n: number, digits: number): string {
   return n.toFixed(digits);
 }
@@ -230,19 +270,48 @@ async function refreshSnapshot(): Promise<GoldSnapshot> {
 
   // International (never fail the whole refresh)
   if (cfg.showInternational) {
-    try {
-      snapshot.xauUsdPerOz = await fetchStooqClose('xauusd');
-      if (snapshot.xauUsdPerOz == null) snapshot.errors.push('XAUUSD returned no usable price');
-    } catch (e: any) {
-      snapshot.errors.push(`XAUUSD fetch failed: ${e?.message ? String(e.message) : String(e)}`);
-    }
+    const source = cfg.internationalSource;
 
-    if (cfg.showInternationalCny) {
+    if (source === 'sina') {
       try {
-        snapshot.usdCny = await fetchStooqClose('usdcny');
-        if (snapshot.usdCny == null) snapshot.errors.push('USDCNY returned no usable price');
+        // Sina FX: fx_sxauusd / fx_susdcny
+        snapshot.xauUsdPerOz = await fetchSinaFxLast('fx_sxauusd');
+        if (snapshot.xauUsdPerOz == null) snapshot.errors.push('Sina XAUUSD returned no usable price');
       } catch (e: any) {
-        snapshot.errors.push(`USDCNY fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+        snapshot.errors.push(`Sina XAUUSD fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+        // fallback
+        try {
+          snapshot.xauUsdPerOz = await fetchStooqClose('xauusd');
+        } catch {}
+      }
+
+      if (cfg.showInternationalCny) {
+        try {
+          snapshot.usdCny = await fetchSinaFxLast('fx_susdcny');
+          if (snapshot.usdCny == null) snapshot.errors.push('Sina USDCNY returned no usable price');
+        } catch (e: any) {
+          snapshot.errors.push(`Sina USDCNY fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+          // fallback
+          try {
+            snapshot.usdCny = await fetchStooqClose('usdcny');
+          } catch {}
+        }
+      }
+    } else {
+      try {
+        snapshot.xauUsdPerOz = await fetchStooqClose('xauusd');
+        if (snapshot.xauUsdPerOz == null) snapshot.errors.push('XAUUSD returned no usable price');
+      } catch (e: any) {
+        snapshot.errors.push(`XAUUSD fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+      }
+
+      if (cfg.showInternationalCny) {
+        try {
+          snapshot.usdCny = await fetchStooqClose('usdcny');
+          if (snapshot.usdCny == null) snapshot.errors.push('USDCNY returned no usable price');
+        } catch (e: any) {
+          snapshot.errors.push(`USDCNY fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+        }
       }
     }
 

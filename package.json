@@ -46,12 +46,18 @@
         "goldPrice.showInternational": {
           "type": "boolean",
           "default": true,
-          "description": "Show XAUUSD (USD/oz) from Stooq."
+          "description": "Show international gold price."
+        },
+        "goldPrice.internationalSource": {
+          "type": "string",
+          "default": "sina",
+          "enum": ["sina", "stooq"],
+          "description": "International data source. sina uses hq.sinajs.cn (better availability in CN); stooq uses stooq.com."
         },
         "goldPrice.showInternationalCny": {
           "type": "boolean",
           "default": true,
-          "description": "Also show XAU converted to CNY/g using USDCNY from Stooq."
+          "description": "Also show XAU converted to CNY/g using USD/CNY from the selected source."
         },
         "goldPrice.emphasize": {
           "type": "boolean",
