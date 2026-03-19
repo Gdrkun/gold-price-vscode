@@ -15,11 +15,20 @@ type SgeDailyHq = {
 
 type GoldSnapshot = {
   sgeSymbol: string;
+
+  // Domestic
   sgePriceCnyPerGram?: number;
   sgeUpdateText?: string;
+  sgeIsFallback?: boolean;
+
+  // International
   xauUsdPerOz?: number;
   usdCny?: number;
   xauCnyPerGram?: number;
+
+  // Stooq direct XAUCNY (CNY per troy ounce). More stable conversion than multiplying XAUUSD*USDCNY.
+  xauCnyPerOz?: number;
+
   fetchedAt: Date;
   errors: string[];
 };
@@ -46,21 +55,33 @@ function parseLastNonZeroQuote(q: SgeQuote): number | undefined {
 }
 
 async function fetchText(url: string, init?: RequestInit, timeoutMs = 12_000): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const attempt = async (): Promise<string> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  try {
-    const res = await fetch(url, {
-      ...init,
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`HTTP ${res.status} ${res.statusText} ${body}`.trim());
+    try {
+      const res = await fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} ${res.statusText} ${body}`.trim());
+      }
+      return await res.text();
+    } finally {
+      clearTimeout(timer);
     }
-    return await res.text();
-  } finally {
-    clearTimeout(timer);
+  };
+
+  // Lightweight retry for flaky networks / transient CDN issues.
+  // Do NOT aggressively retry on VS Code startup.
+  try {
+    return await attempt();
+  } catch (e) {
+    // One retry with small delay.
+    await new Promise((r) => setTimeout(r, 400 + Math.floor(Math.random() * 300)));
+    return await attempt();
   }
 }
 
@@ -130,13 +151,52 @@ function parseStooqCsvClose(csv: string): number | undefined {
 
 async function fetchStooqClose(symbol: string): Promise<number | undefined> {
   const url = `https://stooq.com/q/l/?s=${encodeURIComponent(symbol)}&f=sd2t2c&h&e=csv&t=${Date.now()}`;
-  const csv = await fetchText(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (VSCode Extension; gold-price-vscode)',
-      Accept: 'text/csv,*/*',
+  const csv = await fetchText(
+    url,
+    {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (VSCode Extension; gold-price-vscode)',
+        Accept: 'text/csv,*/*',
+      },
     },
-  });
+    10_000,
+  );
   return parseStooqCsvClose(csv);
+}
+
+async function fetchStooqManyClose(symbols: string[]): Promise<Record<string, number | undefined>> {
+  // Stooq supports comma-separated symbols, which reduces rate-limit risk.
+  // Example: https://stooq.com/q/l/?s=xauusd,usdcny&f=sd2t2c&h&e=csv
+  const s = symbols.map((x) => x.trim()).filter(Boolean);
+  if (!s.length) return {};
+
+  const url = `https://stooq.com/q/l/?s=${s.map(encodeURIComponent).join(',')}&f=sd2t2c&h&e=csv&t=${Date.now()}`;
+  const csv = await fetchText(
+    url,
+    {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (VSCode Extension; gold-price-vscode)',
+        Accept: 'text/csv,*/*',
+      },
+    },
+    10_000,
+  );
+
+  const lines = csv.trim().split(/\r?\n/);
+  if (lines.length < 2) return {};
+  const header = lines[0].split(',');
+  const idxSymbol = header.findIndex((h) => h.toLowerCase() === 'symbol');
+  const idxClose = header.findIndex((h) => h.toLowerCase() === 'close');
+  if (idxSymbol < 0 || idxClose < 0) return {};
+
+  const out: Record<string, number | undefined> = {};
+  for (let i = 1; i < lines.length; i++) {
+    const row = lines[i].split(',');
+    const sym = (row[idxSymbol] ?? '').trim().toLowerCase();
+    const close = Number(row[idxClose]);
+    out[sym] = Number.isFinite(close) ? close : undefined;
+  }
+  return out;
 }
 
 function parseSinaVarLine(line: string): { name: string; values: string[] } | undefined {
@@ -186,7 +246,8 @@ function renderStatus(s: GoldSnapshot): string {
   const parts: string[] = [];
 
   if (s.sgePriceCnyPerGram != null) {
-    parts.push(`${s.sgeSymbol}: ${formatNum(s.sgePriceCnyPerGram, 2)}¥/g`);
+    const tag = s.sgeIsFallback ? ' (≈Intl)' : '';
+    parts.push(`${s.sgeSymbol}: ${formatNum(s.sgePriceCnyPerGram, 2)}¥/g${tag}`);
   } else {
     parts.push(`${s.sgeSymbol}: --`);
   }
@@ -212,7 +273,9 @@ function renderTooltip(s: GoldSnapshot): vscode.MarkdownString {
   md.isTrusted = false;
 
   md.appendMarkdown(`**Gold Price**\n\n`);
-  md.appendMarkdown(`- SGE (${s.sgeSymbol}): ${s.sgePriceCnyPerGram != null ? formatNum(s.sgePriceCnyPerGram, 2) + ' ¥/g' : '--'}\n`);
+  md.appendMarkdown(
+    `- SGE (${s.sgeSymbol}): ${s.sgePriceCnyPerGram != null ? formatNum(s.sgePriceCnyPerGram, 2) + ' ¥/g' : '--'}${s.sgeIsFallback ? ' _(fallback from international)_' : ''}\n`,
+  );
   if (s.sgeUpdateText) md.appendMarkdown(`  - Update: ${s.sgeUpdateText}\n`);
 
   const cfg = getConfig();
@@ -220,6 +283,7 @@ function renderTooltip(s: GoldSnapshot): vscode.MarkdownString {
     md.appendMarkdown(`- XAUUSD: ${s.xauUsdPerOz != null ? formatNum(s.xauUsdPerOz, 2) + ' $/oz' : '--'}\n`);
     if (cfg.showInternationalCny) {
       md.appendMarkdown(`- USDCNY: ${s.usdCny != null ? formatNum(s.usdCny, 5) : '--'}\n`);
+      if (s.xauCnyPerOz != null) md.appendMarkdown(`- XAUCNY: ${formatNum(s.xauCnyPerOz, 2)} ¥/oz\n`);
       md.appendMarkdown(`- XAU (CNY/g): ${s.xauCnyPerGram != null ? formatNum(s.xauCnyPerGram, 2) : '--'}\n`);
     }
   }
@@ -268,6 +332,9 @@ async function refreshSnapshot(): Promise<GoldSnapshot> {
     }
   }
 
+  // If SGE is missing, optionally fall back to international CNY/g (computed later).
+  // We do this after international fetch so that XAUCNY / FX data can be used.
+
   // International (never fail the whole refresh)
   if (cfg.showInternational) {
     const source = cfg.internationalSource;
@@ -298,26 +365,41 @@ async function refreshSnapshot(): Promise<GoldSnapshot> {
         }
       }
     } else {
+      // Stooq supports multi-symbol CSV; fetch in one request for better reliability.
       try {
-        snapshot.xauUsdPerOz = await fetchStooqClose('xauusd');
-        if (snapshot.xauUsdPerOz == null) snapshot.errors.push('XAUUSD returned no usable price');
-      } catch (e: any) {
-        snapshot.errors.push(`XAUUSD fetch failed: ${e?.message ? String(e.message) : String(e)}`);
-      }
+        const want = ['xauusd', cfg.showInternationalCny ? 'usdcny' : null, cfg.showInternationalCny ? 'xaucny' : null]
+          .filter((x): x is string => !!x);
+        const map = await fetchStooqManyClose(want);
 
-      if (cfg.showInternationalCny) {
-        try {
-          snapshot.usdCny = await fetchStooqClose('usdcny');
+        snapshot.xauUsdPerOz = map['xauusd'];
+        if (snapshot.xauUsdPerOz == null) snapshot.errors.push('XAUUSD returned no usable price');
+
+        if (cfg.showInternationalCny) {
+          snapshot.usdCny = map['usdcny'];
           if (snapshot.usdCny == null) snapshot.errors.push('USDCNY returned no usable price');
-        } catch (e: any) {
-          snapshot.errors.push(`USDCNY fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+
+          snapshot.xauCnyPerOz = map['xaucny'];
+          // xauCnyPerGram computed later (prefers direct XAUCNY).
         }
+      } catch (e: any) {
+        snapshot.errors.push(`Stooq fetch failed: ${e?.message ? String(e.message) : String(e)}`);
       }
     }
 
-    if (snapshot.xauUsdPerOz != null && snapshot.usdCny != null) {
+    // Prefer XAUCNY direct when available (avoids cross-source FX mismatch).
+    if (snapshot.xauCnyPerOz != null) {
+      snapshot.xauCnyPerGram = snapshot.xauCnyPerOz / OZ_TO_GRAM;
+    } else if (snapshot.xauUsdPerOz != null && snapshot.usdCny != null) {
       snapshot.xauCnyPerGram = (snapshot.xauUsdPerOz * snapshot.usdCny) / OZ_TO_GRAM;
     }
+  }
+
+  // Final fallback: if SGE is unavailable, show international CNY/g as a stable domestic approximation.
+  if (snapshot.sgePriceCnyPerGram == null && snapshot.xauCnyPerGram != null) {
+    snapshot.sgePriceCnyPerGram = snapshot.xauCnyPerGram;
+    snapshot.sgeUpdateText = `Fallback: Intl (via ${cfg.internationalSource}${snapshot.xauCnyPerOz != null ? ' XAUCNY' : ' XAUUSD×USDCNY'})`;
+    snapshot.sgeIsFallback = true;
+    snapshot.errors.push('SGE unavailable; using international CNY/g fallback');
   }
 
   return snapshot;
