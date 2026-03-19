@@ -2,7 +2,7 @@
   "name": "gold-price-vscode",
   "displayName": "Gold Price (SGE + XAUUSD)",
   "description": "Show SGE (Au99.99) and international gold price (XAUUSD) in the VS Code status bar.",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "publisher": "drkun",
   "repository": {
     "type": "git",
