@@ -43,6 +43,8 @@ function getConfig() {
     showInternationalCny: cfg.get<boolean>('showInternationalCny', true),
     emphasize: cfg.get<boolean>('emphasize', true),
     toastOnManualError: cfg.get<boolean>('toastOnManualError', true),
+    autoBackoff: cfg.get<boolean>('autoBackoff', true),
+    backoffMaxSeconds: cfg.get<number>('backoffMaxSeconds', 60),
   };
 }
 
@@ -494,6 +496,10 @@ export function activate(context: vscode.ExtensionContext) {
   let inFlight = false;
   let lastGood: GoldSnapshot | undefined;
 
+  // Adaptive backoff to reduce WAF / rate-limit pain on flaky networks.
+  let currentIntervalSeconds = Math.max(1, getConfig().refreshSeconds);
+  let consecutiveFailures = 0;
+
   const updateFromSnapshot = (snap: GoldSnapshot, state: VisualState) => {
     const prefix = state === 'error' ? '$(error) ' : state === 'warning' ? '$(warning) ' : '$(pulse) ';
     status.text = prefix + renderStatus(snap);
@@ -501,9 +507,25 @@ export function activate(context: vscode.ExtensionContext) {
     applyVisual(status, state);
   };
 
+  const reschedule = (reason: string) => {
+    const cfg = getConfig();
+    const base = Math.max(1, cfg.refreshSeconds);
+    const max = Math.max(5, cfg.backoffMaxSeconds);
+
+    // Clamp current interval into [1, max] and also never below base unless base is changed.
+    currentIntervalSeconds = Math.max(1, Math.min(currentIntervalSeconds, max));
+
+    if (timer) clearInterval(timer);
+    timer = setInterval(() => void doRefresh(false), currentIntervalSeconds * 1000);
+
+    console.info(`[goldPrice] schedule=${currentIntervalSeconds}s (base=${base}s, max=${max}s) reason=${reason}`);
+  };
+
   const doRefresh = async (manual: boolean) => {
     if (inFlight) return;
     inFlight = true;
+
+    const cfgAtStart = getConfig();
 
     try {
       // Keep last good value visible while refreshing.
@@ -519,10 +541,29 @@ export function activate(context: vscode.ExtensionContext) {
       const hasAny = snap.sgePriceCnyPerGram != null || snap.xauUsdPerOz != null;
       const hasError = snap.errors.length > 0;
 
+      // Backoff logic: treat "no usable data" as failure; treat usable data as success.
+      const autoBackoff = cfgAtStart.autoBackoff;
+      const base = Math.max(1, cfgAtStart.refreshSeconds);
+      const max = Math.max(5, cfgAtStart.backoffMaxSeconds);
+
       if (hasAny) {
+        consecutiveFailures = 0;
+        currentIntervalSeconds = base;
+        if (autoBackoff) reschedule('success');
+
         lastGood = snap;
         updateFromSnapshot(snap, hasError ? 'warning' : 'ok');
       } else {
+        consecutiveFailures++;
+        if (autoBackoff) {
+          // Exponential-ish backoff: base * 2^(n-1), capped by max.
+          const next = Math.min(max, base * Math.pow(2, Math.max(0, consecutiveFailures - 1)));
+          if (next !== currentIntervalSeconds) {
+            currentIntervalSeconds = next;
+            reschedule(`fail#${consecutiveFailures}`);
+          }
+        }
+
         // No usable data; keep lastGood if available.
         if (lastGood) {
           updateFromSnapshot({ ...lastGood, errors: snap.errors }, 'error');
@@ -531,11 +572,23 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
 
-      const cfg = getConfig();
-      if (manual && cfg.toastOnManualError && snap.errors.length) {
+      if (manual && cfgAtStart.toastOnManualError && snap.errors.length) {
         void vscode.window.showWarningMessage(`Gold Price: ${snap.errors[0]}`);
       }
     } catch (e: any) {
+      consecutiveFailures++;
+
+      const cfg = cfgAtStart;
+      if (cfg.autoBackoff) {
+        const base = Math.max(1, cfg.refreshSeconds);
+        const max = Math.max(5, cfg.backoffMaxSeconds);
+        const next = Math.min(max, base * Math.pow(2, Math.max(0, consecutiveFailures - 1)));
+        if (next !== currentIntervalSeconds) {
+          currentIntervalSeconds = next;
+          reschedule(`crash#${consecutiveFailures}`);
+        }
+      }
+
       const msg = e?.message ? String(e.message) : String(e);
       const snap: GoldSnapshot = lastGood
         ? { ...lastGood, fetchedAt: new Date(), errors: [msg] }
@@ -548,11 +601,11 @@ export function activate(context: vscode.ExtensionContext) {
     }
   };
 
-  const schedule = () => {
-    if (timer) clearInterval(timer);
-    const { refreshSeconds } = getConfig();
-    const ms = Math.max(1, refreshSeconds) * 1000;
-    timer = setInterval(() => void doRefresh(false), ms);
+  const schedule = (reason = 'config') => {
+    const cfg = getConfig();
+    currentIntervalSeconds = Math.max(1, cfg.refreshSeconds);
+    consecutiveFailures = 0;
+    reschedule(reason);
   };
 
   context.subscriptions.push(
@@ -565,7 +618,7 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('goldPrice')) {
-        schedule();
+        schedule('config-change');
         void doRefresh(false);
       }
     }),
@@ -576,7 +629,7 @@ export function activate(context: vscode.ExtensionContext) {
     },
   );
 
-  schedule();
+  schedule('activate');
   void doRefresh(false);
 }
 

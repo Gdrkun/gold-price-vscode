@@ -2,7 +2,7 @@
   "name": "gold-price-vscode",
   "displayName": "Gold Price (SGE + XAUUSD)",
   "description": "Show SGE (Au99.99) and international gold price (XAUUSD) in the VS Code status bar.",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "publisher": "drkun",
   "repository": {
     "type": "git",
@@ -68,6 +68,17 @@
           "type": "boolean",
           "default": true,
           "description": "Show a toast message when manual refresh fails. Auto refresh will not spam toasts."
+        },
+        "goldPrice.autoBackoff": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto backoff when refresh keeps failing (recommended for CN networks / WAF-prone sources)."
+        },
+        "goldPrice.backoffMaxSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 5,
+          "description": "Max backoff interval in seconds when autoBackoff is enabled."
         }
       }
     }
