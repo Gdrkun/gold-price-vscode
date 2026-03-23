@@ -37,7 +37,7 @@ function getConfig() {
   const cfg = vscode.workspace.getConfiguration('goldPrice');
   return {
     sgeSymbol: cfg.get<string>('sgeSymbol', 'Au99.99'),
-    refreshSeconds: cfg.get<number>('refreshSeconds', 60),
+    refreshSeconds: cfg.get<number>('refreshSeconds', 5),
     showInternational: cfg.get<boolean>('showInternational', true),
     internationalSource: cfg.get<'sina' | 'stooq'>('internationalSource', 'sina'),
     showInternationalCny: cfg.get<boolean>('showInternationalCny', true),
@@ -56,6 +56,7 @@ function parseLastNonZeroQuote(q: SgeQuote): number | undefined {
 
 async function fetchText(url: string, init?: RequestInit, timeoutMs = 12_000): Promise<string> {
   const attempt = async (): Promise<string> => {
+    const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -64,6 +65,12 @@ async function fetchText(url: string, init?: RequestInit, timeoutMs = 12_000): P
         ...init,
         signal: controller.signal,
       });
+      // Surface basic perf/availability signal in console for debugging.
+      // (No user-visible noise; tooltip errors are handled elsewhere.)
+      const elapsed = Date.now() - startedAt;
+      if (elapsed > 2500) {
+        console.warn(`[goldPrice] slow fetch ${elapsed}ms: ${url}`);
+      }
       if (!res.ok) {
         const body = await res.text().catch(() => '');
         throw new Error(`HTTP ${res.status} ${res.statusText} ${body}`.trim());
@@ -75,10 +82,14 @@ async function fetchText(url: string, init?: RequestInit, timeoutMs = 12_000): P
   };
 
   // Lightweight retry for flaky networks / transient CDN issues.
-  // Do NOT aggressively retry on VS Code startup.
+  // IMPORTANT: do not retry on obvious WAF/forbidden responses (e.g. 403), it only slows down refresh.
   try {
     return await attempt();
-  } catch (e) {
+  } catch (e: any) {
+    const msg = e?.message ? String(e.message) : String(e);
+    if (/\bHTTP\s+403\b/.test(msg) || /\bHTTP\s+401\b/.test(msg)) {
+      throw e;
+    }
     // One retry with small delay.
     await new Promise((r) => setTimeout(r, 400 + Math.floor(Math.random() * 300)));
     return await attempt();
@@ -166,7 +177,8 @@ async function fetchStooqClose(symbol: string): Promise<number | undefined> {
 
 async function fetchStooqManyClose(symbols: string[]): Promise<Record<string, number | undefined>> {
   // Stooq supports comma-separated symbols, which reduces rate-limit risk.
-  // Example: https://stooq.com/q/l/?s=xauusd,usdcny&f=sd2t2c&h&e=csv
+  // HOWEVER: in some environments the multi-symbol endpoint returns "N/D".
+  // We'll detect that and fall back to per-symbol requests.
   const s = symbols.map((x) => x.trim()).filter(Boolean);
   if (!s.length) return {};
 
@@ -190,13 +202,31 @@ async function fetchStooqManyClose(symbols: string[]): Promise<Record<string, nu
   if (idxSymbol < 0 || idxClose < 0) return {};
 
   const out: Record<string, number | undefined> = {};
+  let anyGood = false;
   for (let i = 1; i < lines.length; i++) {
     const row = lines[i].split(',');
     const sym = (row[idxSymbol] ?? '').trim().toLowerCase();
-    const close = Number(row[idxClose]);
-    out[sym] = Number.isFinite(close) ? close : undefined;
+    const rawClose = (row[idxClose] ?? '').trim();
+    const close = Number(rawClose);
+    const val = Number.isFinite(close) ? close : undefined;
+    out[sym] = val;
+    if (val != null) anyGood = true;
   }
-  return out;
+
+  if (anyGood) return out;
+
+  // Fallback: single-symbol requests (more reliable, slightly more requests).
+  const fallback: Record<string, number | undefined> = {};
+  await Promise.all(
+    s.map(async (sym) => {
+      try {
+        fallback[sym.toLowerCase()] = await fetchStooqClose(sym);
+      } catch {
+        fallback[sym.toLowerCase()] = undefined;
+      }
+    }),
+  );
+  return fallback;
 }
 
 function parseSinaVarLine(line: string): { name: string; values: string[] } | undefined {
@@ -307,65 +337,80 @@ async function refreshSnapshot(): Promise<GoldSnapshot> {
     errors: [],
   };
 
-  // SGE (try intraday first, fallback to daily close)
-  try {
-    const sge = await fetchSgeIntraday(cfg.sgeSymbol);
-    snapshot.sgePriceCnyPerGram = sge.price;
-    snapshot.sgeUpdateText = sge.updateText;
-
-    if (snapshot.sgePriceCnyPerGram == null) {
-      snapshot.errors.push('SGE intraday returned no usable price');
-      const daily = await fetchSgeDailyClose(cfg.sgeSymbol);
-      snapshot.sgePriceCnyPerGram = daily.price;
-      snapshot.sgeUpdateText = daily.updateText;
-      if (snapshot.sgePriceCnyPerGram == null) snapshot.errors.push('SGE daily close returned no usable price');
-    }
-  } catch (e: any) {
-    snapshot.errors.push(`SGE fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+  // Fetch SGE + International in parallel to reduce total refresh latency.
+  const sgeTask = (async () => {
+    // SGE (try intraday first, fallback to daily close)
     try {
-      const daily = await fetchSgeDailyClose(cfg.sgeSymbol);
-      snapshot.sgePriceCnyPerGram = daily.price;
-      snapshot.sgeUpdateText = daily.updateText;
-      if (snapshot.sgePriceCnyPerGram == null) snapshot.errors.push('SGE daily close returned no usable price');
-    } catch (e2: any) {
-      snapshot.errors.push(`SGE daily close failed: ${e2?.message ? String(e2.message) : String(e2)}`);
+      const sge = await fetchSgeIntraday(cfg.sgeSymbol);
+      snapshot.sgePriceCnyPerGram = sge.price;
+      snapshot.sgeUpdateText = sge.updateText;
+
+      if (snapshot.sgePriceCnyPerGram == null) {
+        snapshot.errors.push('SGE intraday returned no usable price');
+        const daily = await fetchSgeDailyClose(cfg.sgeSymbol);
+        snapshot.sgePriceCnyPerGram = daily.price;
+        snapshot.sgeUpdateText = daily.updateText;
+        if (snapshot.sgePriceCnyPerGram == null) snapshot.errors.push('SGE daily close returned no usable price');
+      }
+    } catch (e: any) {
+      snapshot.errors.push(`SGE fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+      try {
+        const daily = await fetchSgeDailyClose(cfg.sgeSymbol);
+        snapshot.sgePriceCnyPerGram = daily.price;
+        snapshot.sgeUpdateText = daily.updateText;
+        if (snapshot.sgePriceCnyPerGram == null) snapshot.errors.push('SGE daily close returned no usable price');
+      } catch (e2: any) {
+        snapshot.errors.push(`SGE daily close failed: ${e2?.message ? String(e2.message) : String(e2)}`);
+      }
     }
-  }
+  })();
 
-  // If SGE is missing, optionally fall back to international CNY/g (computed later).
-  // We do this after international fetch so that XAUCNY / FX data can be used.
+  const intlTask = (async () => {
+    // International (never fail the whole refresh)
+    if (!cfg.showInternational) return;
 
-  // International (never fail the whole refresh)
-  if (cfg.showInternational) {
     const source = cfg.internationalSource;
 
     if (source === 'sina') {
+      // Prefer batching into ONE request to reduce latency and WAF risk.
+      const want = ['fx_sxauusd', cfg.showInternationalCny ? 'fx_susdcny' : null].filter((x): x is string => !!x);
       try {
-        // Sina FX: fx_sxauusd / fx_susdcny
-        snapshot.xauUsdPerOz = await fetchSinaFxLast('fx_sxauusd');
+        const map = await fetchSinaQuotes(want);
+
+        const xau = map['fx_sxauusd'];
+        if (xau && xau.length >= 4) {
+          const last = Number(xau[3]);
+          snapshot.xauUsdPerOz = Number.isFinite(last) ? last : undefined;
+        }
         if (snapshot.xauUsdPerOz == null) snapshot.errors.push('Sina XAUUSD returned no usable price');
+
+        if (cfg.showInternationalCny) {
+          const fx = map['fx_susdcny'];
+          if (fx && fx.length >= 4) {
+            const last = Number(fx[3]);
+            snapshot.usdCny = Number.isFinite(last) ? last : undefined;
+          }
+          if (snapshot.usdCny == null) snapshot.errors.push('Sina USDCNY returned no usable price');
+        }
       } catch (e: any) {
-        snapshot.errors.push(`Sina XAUUSD fetch failed: ${e?.message ? String(e.message) : String(e)}`);
-        // fallback
+        snapshot.errors.push(`Sina fetch failed: ${e?.message ? String(e.message) : String(e)}`);
+
+        // Fallback to stooq single-symbol requests (more reliable across networks).
         try {
           snapshot.xauUsdPerOz = await fetchStooqClose('xauusd');
         } catch {}
-      }
 
-      if (cfg.showInternationalCny) {
-        try {
-          snapshot.usdCny = await fetchSinaFxLast('fx_susdcny');
-          if (snapshot.usdCny == null) snapshot.errors.push('Sina USDCNY returned no usable price');
-        } catch (e: any) {
-          snapshot.errors.push(`Sina USDCNY fetch failed: ${e?.message ? String(e.message) : String(e)}`);
-          // fallback
+        if (cfg.showInternationalCny) {
           try {
             snapshot.usdCny = await fetchStooqClose('usdcny');
+          } catch {}
+          try {
+            snapshot.xauCnyPerOz = await fetchStooqClose('xaucny');
           } catch {}
         }
       }
     } else {
-      // Stooq supports multi-symbol CSV; fetch in one request for better reliability.
+      // Stooq supports multi-symbol CSV; fetch in one request when possible.
       try {
         const want = ['xauusd', cfg.showInternationalCny ? 'usdcny' : null, cfg.showInternationalCny ? 'xaucny' : null]
           .filter((x): x is string => !!x);
@@ -392,7 +437,9 @@ async function refreshSnapshot(): Promise<GoldSnapshot> {
     } else if (snapshot.xauUsdPerOz != null && snapshot.usdCny != null) {
       snapshot.xauCnyPerGram = (snapshot.xauUsdPerOz * snapshot.usdCny) / OZ_TO_GRAM;
     }
-  }
+  })();
+
+  await Promise.allSettled([sgeTask, intlTask]);
 
   // Final fallback: if SGE is unavailable, show international CNY/g as a stable domestic approximation.
   if (snapshot.sgePriceCnyPerGram == null && snapshot.xauCnyPerGram != null) {
@@ -504,7 +551,7 @@ export function activate(context: vscode.ExtensionContext) {
   const schedule = () => {
     if (timer) clearInterval(timer);
     const { refreshSeconds } = getConfig();
-    const ms = Math.max(10, refreshSeconds) * 1000;
+    const ms = Math.max(1, refreshSeconds) * 1000;
     timer = setInterval(() => void doRefresh(false), ms);
   };
 

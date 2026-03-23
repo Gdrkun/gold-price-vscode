@@ -2,7 +2,7 @@
   "name": "gold-price-vscode",
   "displayName": "Gold Price (SGE + XAUUSD)",
   "description": "Show SGE (Au99.99) and international gold price (XAUUSD) in the VS Code status bar.",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "publisher": "drkun",
   "repository": {
     "type": "git",
@@ -39,9 +39,9 @@
         },
         "goldPrice.refreshSeconds": {
           "type": "number",
-          "default": 60,
-          "minimum": 10,
-          "description": "Auto refresh interval in seconds."
+          "default": 5,
+          "minimum": 1,
+          "description": "Auto refresh interval in seconds. (Note: too frequent refresh may trigger rate-limits / WAF on some data sources.)"
         },
         "goldPrice.showInternational": {
           "type": "boolean",
